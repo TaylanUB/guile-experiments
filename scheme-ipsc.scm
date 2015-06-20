@@ -39,12 +39,13 @@
 
 ;;; Code:
 
-(define-module (taylan scheme)
+(define-module (taylan scheme-ipsc)
   #:export (mcrepl mceval mcexpand expansion-env mcexecute execution-env))
 
 (use-modules (ice-9 match)
              (srfi srfi-9)
-             (srfi srfi-9 gnu))
+             (srfi srfi-9 gnu)
+             (srfi srfi-11))
 
 ;;; Data types
 
@@ -66,10 +67,6 @@
 (define-record-type <mcuninjection>
   (make-mcuninjection object) mcuninjection?
   (object mcuninjection-object))
-
-;; (define-record-type <mcpreexpanded>
-;;   (make-mcpreexpanded code) mcpreexpanded?
-;;   (code mcpreexpanded-code))
 
 (define-record-type <mcvariable>
   (make-mcvariable name) mcvariable?
@@ -107,11 +104,6 @@
  <mcuninjection>
  (lambda (obj port)
    (format port "{u ~s}" (mcuninjection-object obj))))
-
-;; (set-record-type-printer!
-;;  <mcpreexpanded>
-;;  (lambda (obj port)
-;;    (format port "{p ~s}" (mcpreexpanded-code obj))))
 
 (set-record-type-printer!
  <mcvariable>
@@ -156,60 +148,81 @@
 
 ;;; Expansion
 
-(define* (mcexpand form env #:optional original-env)
-  (define (map-mcexpand forms)
-    (map (lambda (x) (mcexpand x env original-env)) forms))
-  (match form
-    (((? symbol? operator) operands ...)
-     (let ((binding (get env operator)))
-       (if (mcspecial? binding)
-           (apply-mcspecial binding operands env original-env)
-           `(APPLY ,(mcexpand operator env original-env)
-                   ,(map-mcexpand operands)))))
-    ((operator operands ...)
-     (let ((operator (mcexpand operator env original-env)))
-       (if (mcspecial? operator)
-           (apply-mcspecial operator operands env original-env)
-           `(APPLY ,operator ,(map-mcexpand operands)))))
-    ((? symbol? symbol)
-     (let ((binding (get env symbol)))
-       (if binding
-           `(REF ,binding)
-           `(REF ,symbol))))
-    ((? mcsyntax? syn)
-     (mcexpand (mcsyntax-form syn) env original-env))
-    ((? mcinjection? inj)
-     `(INJECT ,(mcexpand (mcinjection-form inj)
-                         (mcinjection-expansion-env inj)
-                         env)
-              ,(mcinjection-execution-env inj)))
-    ((? mcuninjection? uninj)
-     `(UNINJECT ,(match (mcuninjection-object uninj)
-                   ((and obj (or (? mcsyntax?) (? mcinjection?)))
-                    (mcexpand obj original-env))
-                   ((? symbol? sym)
-                    (error "raw symbol in macro output:" sym))
-                   (constant
-                    `(CONST ,constant)))))
-    ;; ((? mcpreexpanded? preexpanded)
-    ;;  (mcpreexpanded-code preexpanded))
-    (constant
-     `(CONST ,constant))))
+(define* (mcexpand
+          form #:optional (env expansion-env) orig-env raw-macro-output?)
+  (let-values (((form env oenv rmo?)
+                (unwrap-macro-output form env orig-env raw-macro-output?)))
+    (define (map-mcexpand forms)
+      (map (lambda (x) (mcexpand x env oenv rmo?)) forms))
+    (match form
+      ((operator operands ...)
+       (let-values (((op op-env op-oenv op-rmo?)
+                     (unwrap-macro-output operator env oenv rmo?)))
+         (match op
+           ((? symbol? sym)
+            (if op-rmo? (error "macro output contained raw symbol" sym)
+                (let ((binding (get op-env sym)))
+                  (if (mcspecial? binding)
+                      (apply-mcspecial binding operands env oenv rmo?)
+                      `(APPLY ,(mcexpand sym op-env op-oenv op-rmo?)
+                              ,(map-mcexpand operands))))))
+           (form
+            (let ((op (mcexpand form op-env op-oenv op-rmo?)))
+              (if (mcspecial? op)
+                  (apply-mcspecial op operands env env rmo?)
+                  `(APPLY ,op ,(map-mcexpand operands))))))))
+      ((? symbol? symbol)
+       (if rmo? (error "macro output contained raw symbol" symbol)
+           (let ((binding (get env symbol)))
+             (if binding
+                 `(REF ,binding)
+                 `(REF ,symbol)))))
+      ((? mcinjection? inj)
+       (let ((code (mcinjection-form inj))
+             (exec-env (mcinjection-execution-env inj)))
+        `(INJECT ,code ,exec-env)))
+      (constant
+       `(CONST ,constant)))))
 
-(define (apply-mcspecial mcspecial operands env orig-env)
-  ((mcspecial-procedure mcspecial) operands env orig-env))
+(define (unwrap-macro-output form env orig-env raw-macro-output?)
+  (if raw-macro-output?
+      (match form
+        ((? mcsyntax? syn)
+         (unwrap-macro-output (mcsyntax-form syn) env orig-env #f))
+        ((? mcinjection? inj)
+         (let ((form (mcinjection-form inj))
+               (new-env (mcinjection-expansion-env inj))
+               (exec-env (mcinjection-execution-env inj)))
+           (values form new-env )))
+        ((? mcuninjection? uninj)
+         (error "uninjection in raw macro output, what the hell?" uninj))
+        (form
+         (values form env orig-env raw-macro-output?)))
+      (match form
+        ((? mcuninjection? uninj)
+         (if orig-env
+             (let ((obj (mcuninjection-object uninj)))
+               (values obj orig-env #f #t))
+             (error "uninjection without orig-env, what the hell?" uninj)))
+        (form
+         (values form env orig-env raw-macro-output?)))))
+
+(define (apply-mcspecial mcspecial operands env orig-env raw-macro-output?)
+  ((mcspecial-procedure mcspecial) operands env orig-env raw-macro-output?))
 
 (define-syntax-rule
-  (define-mcspecial (name . operand-pattern) env orig-env body body* ...)
+  (define-mcspecial env orig-env raw-macro-output?
+    (name . operand-pattern)
+    body body* ...)
   (put! expansion-env 'name (make-mcspecial
                              'name
-                             (lambda (operands env orig-env)
+                             (lambda (operands env orig-env raw-macro-output?)
                                (match operands
                                  (operand-pattern
                                   (let () body body* ...)))))))
 
 
-(define-mcspecial (lambda arglist body) env orig-env
+(define-mcspecial env orig-env raw-macro-output? (lambda arglist body)
   ;; We have a bit of a problem here: the user could nest the parameter list in
   ;; arbitrarily deep syntax/unsyntax forms, and the same thing for every
   ;; individual parameter, and it would be very hard for us to get the
@@ -220,36 +233,40 @@
       ((? mcuninjection? uninj)
        (repeat (mcuninjection-object uninj) #t))
       (((? mcsyntax? syns) ...)
-       (repeat (map (lambda (s) (mcsyntax-form s)) syns) #t))
+       (repeat (map mcsyntax-form syns) #t))
       ((? list? arglist)
        (let* ((variables (map make-mcvariable arglist))
-              (env-appendice (map cons arglist variables))
-              (env (if use-orig-env? env (env-append env env-appendice)))
-              (orig-env (if use-orig-env? (env-append orig-env env-appendice)
+              (bindings (map cons arglist variables))
+              (env (if use-orig-env? env (env-append env bindings)))
+              (orig-env (if use-orig-env? (env-append orig-env bindings)
                             orig-env)))
-         `(LAMBDA ,variables ,(mcexpand body env orig-env))))
+         `(LAMBDA ,variables ,(mcexpand body env orig-env raw-macro-output?))))
       (form
        (error "invalid lambda arglist" form)))))
 
 
-(define-mcspecial (quote form) env orig-env
+(define-mcspecial env orig-env raw-macro-output? (quote form)
   `(QUOTE ,form))
 
-(let ((unquoter (cons 'unquote #f)))
+(let ((unquoter (make-mcspecial
+                 'unquote
+                 (lambda (operands env orig-env raw-macro-output?)
+                   (error "cannot unquote outside of quasiquote")))))
   (put! expansion-env 'unquote unquoter)
-  (define-mcspecial (quasiquote form) env orig-env
+  (define-mcspecial env orig-env raw-macro-output? (quasiquote form)
     `(QUASIQUOTE
       ,(let traverse ((form form))
          (match form
            (((? (lambda (x) (eq? unquoter (get env x)))) form)
-            `(UNQUOTE ,(mcexpand form env orig-env)))
+            `(UNQUOTE ,(mcexpand form env orig-env raw-macro-output?)))
            ((form . forms)
             (cons (traverse form) (traverse forms)))
            (form
             form))))))
 
 
-(define-mcspecial (let-syntax (((? symbol? names) forms) ...) body) env orig-env
+(define-mcspecial env orig-env raw-macro-output?
+  (let-syntax (((? symbol? names) forms) ...) body)
   (define (make-mcmacros forms names)
     (map (lambda (x n) (make-mcmacro x env orig-env n)) forms names))
   (let ((env (env-append env (map cons names (make-mcmacros forms names)))))
@@ -258,12 +275,13 @@
 (define (make-mcmacro form env orig-env name)
   (let ((macro-proc (mcexecute (mcexpand form env orig-env) execution-env)))
     (make-mcspecial name
-                    (lambda (form env orig-env)
-                      (mcexpand #;syntax-unwrap
+                    (lambda (form env orig-env raw-macro-output?)
+                      (mcexpand
                        (mcapply macro-proc
                                 (list (syntax-wrap form env)))
                        env
-                       orig-env)))))
+                       orig-env
+                       #t)))))
 
 (define (syntax-wrap form env)
   (let traverse ((form form))
@@ -273,39 +291,15 @@
       (atom
        (make-mcsyntax atom)))))
 
-;; (define (syntax-unwrap obj env)
-;;   (let traverse ((obj obj))
-;;     (match obj
-;;       ((? mcsyntax? syn)
-;;        (mcexpand (mcsyntax-form syn) env))
-;;       ((? mcinjection? inj)
-;;        (let ((form (mcinjection-form inj))
-;;              (expansion-env (mcinjection-expansion-env inj))
-;;              (execution-env (mcinjection-execution-env inj)))
-;;          `(INJECT
-;;            ,(mcexpand (let traverse ((form form))
-;;                         (match form
-;;                           ((forms ...)
-;;                            (map traverse forms))
-;;                           ((? mcuninjection? uninj)
-;;                            (let ((obj (mcuninjection-object uninj)))
-;;                              (make-mcpreexpanded
-;;                               `(UNINJECT
-;;                                 ,(syntax-unwrap obj env)))))
-;;                           (form
-;;                            form)))
-;;                       expansion-env)
-;;            ,execution-env)))
-;;       (obj
-;;        `(CONST ,obj)                            #;
-;;        (error "macro returned non-syntax, non-injection datum" obj)))))
-
-(define-mcspecial (syntax form) env orig-env
+(define-mcspecial env orig-env raw-macro-output? (syntax form)
   `(SYNTAX ,form ,env))
 
-(let ((unsyntaxer (cons 'unsyntax #f)))
+(let ((unsyntaxer (make-mcspecial
+                   'unsyntax
+                   (lambda (operands env orig-env)
+                     (error "cannot unsyntax outside of quasisyntax")))))
   (put! expansion-env 'unsyntax unsyntaxer)
-  (define-mcspecial (quasisyntax form) env orig-env
+  (define-mcspecial env orig-env raw-macro-output? (quasisyntax form)
     `(QUASISYNTAX
       ,(let traverse ((form form))
          (match form
@@ -320,10 +314,10 @@
 
 ;;; Execution
 
-(define* (mcexecute code env #:optional original-env)
+(define* (mcexecute code #:optional (env execution-env) orig-env)
   (match code
     (('LAMBDA variables body)
-     (make-mcprocedure env original-env variables body))
+     (make-mcprocedure env orig-env variables body))
     (('QUOTE form)
      form)
     (('SYNTAX form expansion-env)
@@ -332,7 +326,7 @@
      (let traverse ((form form))
        (match form
          (('UNQUOTE code)
-          (mcexecute code env original-env))
+          (mcexecute code env orig-env))
          ((form . forms)
           (cons (traverse form) (traverse forms)))
          (form
@@ -342,7 +336,7 @@
       (let traverse ((form form))
         (match form
           (('UNSYNTAX code)
-           (make-mcuninjection (mcexecute code env original-env)))
+           (make-mcuninjection (mcexecute code env orig-env)))
           ((form . forms)
            (cons (traverse form) (traverse forms)))
           (form
@@ -352,14 +346,14 @@
     (('INJECT code injection-env)
      (mcexecute code injection-env env))
     (('UNINJECT code)
-     (mcexecute code original-env))
+     (mcexecute code orig-env))
     (('APPLY operator operands)
-     (mcapply (mcexecute operator env original-env)
-              (map (lambda (x) (mcexecute x env original-env)) operands)))
+     (mcapply (mcexecute operator env orig-env)
+              (map (lambda (x) (mcexecute x env orig-env)) operands)))
     (('REF variable)
      (let ((value (get env variable)))
        ;; Cheat a bit so we can run some real code.
-       (or value (module-ref (resolve-module '(taylan scheme)) variable))))
+       (or value (module-ref (resolve-module '(guile)) variable))))
     (('CONST constant)
      constant)
     (form
@@ -391,7 +385,7 @@
      (mceval form))))
 
 (define (mceval form)
-  (mcexecute (mcexpand form expansion-env) execution-env))
+  (mcexecute (mcexpand form)))
 
 (define (mcrepl)
   (display ">>> ")
@@ -408,5 +402,4 @@
  '(define-syntax let (lambda (form)
                        #`(apply (lambda #,(map car (car form))
                                   #,(cadr form))
-                                #,(map cadr (car form)))
-                       )))
+                                #,(map cadr (car form))))))
