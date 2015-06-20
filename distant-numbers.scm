@@ -1,21 +1,27 @@
-(define (n x max sub)                   ;start with sub=max
-  (cond ((= 0 x) (values 0 sub))
-        ((= 1 x) (values max sub))
-        ((= 2 x) (values (/ max 2.0) sub))
-        (else (let-values (((prev sub) (n (- x 1) max sub)))
-                (let ((y (- prev sub)))
-                  (if (< y 0)
-                      (values (- max (/ sub 4.0)) (/ sub 2.0))
-                      (values y sub)))))))
+;;; Generate sequence of numbers in a certain range where every number is
+;;; maximally distant to all previous numbers, e.g. for range 100, yield 0, 100,
+;;; 50, 25, 75, 12.5, 37.5, ...
 
-(define (n x max sub)                   ;start with sub=2max
-  (cond ((= 0 x) (values 0 sub))
-        ((= 1 x) (values max sub))
-        (else (let-values (((y sub) (n (- x 1) max sub)))
-                (let ((y (- y sub)))
-                  (if (< y 0)
-                      (values (- max (/ sub 4.0)) (/ sub 2.0))
-                      (values y sub)))))))
+(define (n x max)
+  (let rec ((x x) (max max) (sub max))
+    (cond ((= 0 x) (values 0 sub))
+          ((= 1 x) (values max sub))
+          ((= 2 x) (values (/ max 2.0) sub))
+          (else (let-values (((prev sub) (rec (- x 1) max sub)))
+                  (let ((y (- prev sub)))
+                    (if (< y 0)
+                        (values (- max (/ sub 4.0)) (/ sub 2.0))
+                        (values y sub))))))))
+
+(define (n x max)
+  (let rec ((x x) (max max) (sub (* 2 max)))
+    (cond ((= 0 x) (values 0 sub))
+          ((= 1 x) (values max sub))
+          (else (let-values (((y sub) (rec (- x 1) max sub)))
+                  (let ((y (- y sub)))
+                    (if (< y 0)
+                        (values (- max (/ sub 4.0)) (/ sub 2.0))
+                        (values y sub))))))))
 
 ;;; The two above work, but are recursive and use MV returns, not nice.  The
 ;;; following fails to start the sequence with 0, n, n/2, it starts either with
